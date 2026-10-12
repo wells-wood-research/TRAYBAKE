@@ -1,0 +1,311 @@
+diff --git a/qupkake/featurizer.py b/qupkake/featurizer.py
+index a221a50..37e0285 100755
+--- a/qupkake/featurizer.py
++++ b/qupkake/featurizer.py
+@@ -12,7 +12,7 @@ from rdkit.Chem import AllChem, Descriptors3D, Lipinski
+ from rdkit.Chem.rdmolops import GetAdjacencyMatrix
+ from torch_geometric.data import Data
+ 
+-from .xtbp import XTBP, RunXTB
++from .xtbp import XTBError, XTBP, RunXTB
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -248,9 +248,9 @@ class BondFeaturizer(FeaturizerAbstract):
+         if self.xtb:
+             if BOND_FEATURES["xTB-WBO"]:
+                 bond_feature_vector += [
+-                    attributes["bondprop"]["wbo"][bond.GetBeginAtomIdx()][
+-                        bond.GetEndAtomIdx()
+-                    ]
++                    attributes["bondprop"]["wbo"][bond.GetBeginAtomIdx()].get(
++                        bond.GetEndAtomIdx(), 0.0
++                    )
+                 ]
+ 
+         return torch.tensor(bond_feature_vector, dtype=torch.float)
+@@ -496,7 +496,7 @@ class Featurizer:
+         if self.xtb:
+             try:
+                 xtb_out = RunXTB(
+-                    self.mol, f"--opt --alpb water --lmo -P {self.num_processes}"
++                    self.mol, f"--alpb water --lmo -P {self.num_processes}"
+                 )
+                 xtbp = XTBP(xtb_out())
+                 mol_attributes = xtbp()
+@@ -508,7 +508,9 @@ class Featurizer:
+                 mol_attributes["atomprop"]["fukui"] = fukui["atomprop"]["fukui"]
+             except Exception as e:
+                 self._handle_processing_error(e)
+-                mol_attributes = {}
++                raise XTBError(
++                    f"xTB feature calculation failed for {self.name}: {e}"
++                ) from e
+         else:
+             mol_attributes = {}
+         return mol_attributes
+@@ -627,7 +629,7 @@ class Featurizer:
+     #     if self.xtb:
+     #         xtb_start_time = timeit.default_timer()
+     #         xtb_out = RunXTB(
+-    #             self.mol, f"--opt --alpb water --lmo -P {self.num_processes}"
++    #             self.mol, f"--alpb water --lmo -P {self.num_processes}"
+     #         )
+     #         xtbp = XTBP(xtb_out())
+     #         mol_attributes = xtbp()
+diff --git a/qupkake/mol_dataset.py b/qupkake/mol_dataset.py
+index bbe84aa..24bda44 100644
+--- a/qupkake/mol_dataset.py
++++ b/qupkake/mol_dataset.py
+@@ -17,12 +17,24 @@ from tqdm import tqdm
+ 
+ from .featurizer import Featurizer
+ from .mol_utils import Tautomerize
++from .xtbp import XTBError
+ 
+ RDLogger.DisableLog("rdApp.*")
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _find_xtb_error(error):
++    """Return an XTBError from an exception chain, if present."""
++    seen = set()
++    while error is not None and id(error) not in seen:
++        if isinstance(error, XTBError):
++            return error
++        seen.add(id(error))
++        error = error.__cause__ or error.__context__
++    return None
++
++
+ class MolPairData(Data):
+     """Representation of a pair of molecules."""
+ 
+@@ -363,6 +375,17 @@ class MolPairDataset(MolDatasetAbstract):
+                 else:
+                     self._load_processed_data(file_name)
+             except Exception as e:
++                if _find_xtb_error(e) is not None:
++                    bad_idx.append(index)
++                    logger.error(
++                        "Skipping protonation pair row %s (site %s, %s) after xTB failure: %s",
++                        index,
++                        row[self.idx_col],
++                        row[self.type_col],
++                        e,
++                    )
++                    logger.error(traceback.format_exc())
++                    continue
+                 bad_idx.append(index)
+                 self._handle_processing_error(row, e)
+         chunk = chunk.drop(bad_idx).reset_index(drop=True)
+@@ -382,6 +405,8 @@ class MolPairDataset(MolDatasetAbstract):
+                 self._save_processed_data(file_name, data)
+                 break
+             except Exception as e:
++                if _find_xtb_error(e) is not None:
++                    raise
+                 tries -= 1
+                 if tries == 0:
+                     self._handle_retry_error(row, e)
+@@ -600,9 +625,12 @@ class MolDataset(MolDatasetAbstract):
+             return None
+ 
+     def opt_mol(self, mol, addCoords=True):
+-        """Embeds the molecule"""
++        """Prepare a conformer, preserving coordinates when a 3D one exists."""
+ 
+         mol = Chem.AddHs(mol, addCoords=True)
++        if mol.GetNumConformers() and mol.GetConformer().Is3D():
++            return mol
++
+         conf = AllChem.EmbedMolecule(
+             mol, useRandomCoords=True, ignoreSmoothingFailures=True
+         )
+@@ -681,6 +709,8 @@ class MolDataset(MolDatasetAbstract):
+                 else:
+                     self._load_processed_data(file_name)
+             except Exception as e:
++                if _find_xtb_error(e) is not None:
++                    raise
+                 bad_idx.append(index)
+                 self._handle_processing_error(row, e)
+                 pass
+@@ -702,6 +732,9 @@ class MolDataset(MolDatasetAbstract):
+                 self._save_processed_data(file_name, data)
+                 break
+             except Exception as e:
++                if _find_xtb_error(e) is not None:
++                    self._handle_retry_error(row, e)
++                    raise
+                 tries -= 1
+                 if tries == 0:
+                     self._handle_retry_error(row, e)
+diff --git a/qupkake/mol_utils.py b/qupkake/mol_utils.py
+index afa43d7..35d41bd 100755
+--- a/qupkake/mol_utils.py
++++ b/qupkake/mol_utils.py
+@@ -170,7 +170,7 @@ class Tautomerize:
+                 taut_file = f"{tmpdirname}/{self.name}_t{i}.mol"
+                 Chem.MolToMolFile(taut, taut_file)
+                 xtb_out = RunXTB(
+-                    taut_file, f"--opt --alpb water --lmo -P {self.num_processes}"
++                    taut_file, f"--alpb water --lmo -P {self.num_processes}"
+                 )
+                 xtbp = XTBP(xtb_out())
+                 mol_attributes = xtbp()
+diff --git a/qupkake/predict.py b/qupkake/predict.py
+index f33dbfd..a9157e1 100644
+--- a/qupkake/predict.py
++++ b/qupkake/predict.py
+@@ -167,6 +167,12 @@ def predict_pka(dataset: MolPairDataset, model: PredictpKa) -> torch.Tensor:
+     Returns:
+         torch.Tensor: predicted pKa values
+     """
++    if len(dataset) == 0:
++        raise RuntimeError(
++            "QupKake could not featurize any protonation pairs; see "
++            f"{dataset.root}/logs/error_log.txt for the xTB diagnostics."
++        )
++
+     trainer = pl.Trainer(
+         logger=False,
+         enable_progress_bar=False,
+diff --git a/qupkake/xtbp.py b/qupkake/xtbp.py
+index 4b1bccc..1a7f393 100755
+--- a/qupkake/xtbp.py
++++ b/qupkake/xtbp.py
+@@ -3,8 +3,8 @@ import os
+ import re
+ import shutil
+ import tempfile
+-from itertools import groupby
+-from subprocess import PIPE, CalledProcessError, run
++from itertools import count, groupby
++from subprocess import run
+ from typing import Any, Union
+ 
+ from rdkit import Chem
+@@ -14,6 +14,34 @@ from . import XTB_LOCATION
+ print(XTB_LOCATION)
+ 
+ 
++DEFAULT_SCF_ITERATIONS = 1000
++_XTB_LOG_COUNTER = count()
++
++
++def _xtb_options(options: str) -> list[str]:
++    """Apply QupKake's default SCF iteration limit unless explicitly set."""
++    arguments = options.split()
++    if not any(
++        argument == "--iterations" or argument.startswith("--iterations=")
++        for argument in arguments
++    ):
++        arguments.extend(("--iterations", str(DEFAULT_SCF_ITERATIONS)))
++    return arguments
++
++
++def _xtb_log_paths(directory: str) -> tuple[str, str]:
++    """Return unique persistent stdout and stderr paths for one xTB run."""
++    prefix = f"xtb-{os.getpid()}-{next(_XTB_LOG_COUNTER):04d}"
++    return (
++        os.path.join(directory, f"{prefix}.stdout.log"),
++        os.path.join(directory, f"{prefix}.stderr.log"),
++    )
++
++
++class XTBError(RuntimeError):
++    """Raised when an xTB calculation or its output parsing fails."""
++
++
+ class RunXTB:
+     """Runs xTB-GFN2 on a mol and parses the output.
+     Attributes:
+@@ -140,33 +168,63 @@ class RunXTB:
+             xTB output as a list of lines.
+         """
+         working_dir = os.getcwd()
++        log_directory = os.environ.get("QUPKAKE_XTB_LOG_DIR", working_dir)
++        os.makedirs(log_directory, exist_ok=True)
+         with tempfile.TemporaryDirectory() as tmpdirname:
+             self.mol_file = self._get_mol_file(tmpdirname)
+-            os.chdir(tmpdirname)
+             filepath = os.path.join(tmpdirname, os.path.basename(self.mol_file))
+-            try:
+-                process = run(
+-                    [XTB_LOCATION, filepath] + self.options.split(),
+-                    stdout=PIPE,
+-                    stderr=PIPE,
+-                    encoding="utf-8",
+-                    check=True,
++            options = _xtb_options(self.options)
++            options_text = " ".join(options)
++            command = [XTB_LOCATION, filepath] + options
++            stdout_path, stderr_path = _xtb_log_paths(log_directory)
++            self.stdout_log = stdout_path
++            self.stderr_log = stderr_path
++            with open(stdout_path, "w", encoding="utf-8") as stdout_file, open(
++                stderr_path, "w", encoding="utf-8"
++            ) as stderr_file:
++                try:
++                    os.chdir(tmpdirname)
++                    process = run(
++                        command,
++                        stdout=stdout_file,
++                        stderr=stderr_file,
++                        check=False,
++                    )
++                finally:
++                    os.chdir(working_dir)
++
++            with open(stdout_path, "r", encoding="utf-8", errors="replace") as stream:
++                stdout = stream.read()
++            with open(stderr_path, "r", encoding="utf-8", errors="replace") as stream:
++                stderr = stream.read()
++
++            if process.returncode:
++                details = "\n".join(
++                    part.strip() for part in (stderr, stdout) if part and part.strip()
+                 )
+-                if process.stderr == "abnormal termination of xtb":
+-                    raise RuntimeError("Problem running xtb on molecule")
+-                else:
+-                    if "--opt" in self.options.split():
+-                        self.opt_done = True
+-                        # self.opt_mol = self._get_mol_from_file(
+-                        #     os.path.join(tmpdirname, "xtbtopo.mol")
+-                        # )
+-
+-            except CalledProcessError as exc:
+-                os.chdir(working_dir)
+-                raise RuntimeError("Problem running xtb on molecule") from exc
+-
+-            os.chdir(working_dir)
+-            return process.stdout
++                if details:
++                    details = "\n".join(details.splitlines()[-40:])
++                message = (
++                    f"xTB failed with exit status {process.returncode} "
++                    f"for options {options_text!r}"
++                )
++                if details:
++                    message += f":\n{details}"
++                message += (
++                    f"\nFull xTB output saved to stdout={stdout_path} "
++                    f"stderr={stderr_path}"
++                )
++                raise XTBError(message)
++
++            if stderr and "abnormal termination of xtb" in stderr:
++                raise XTBError(
++                    "xTB reported abnormal termination for options "
++                    f"{options_text!r}: {stderr.strip()}; full xTB output saved to "
++                    f"stdout={stdout_path} stderr={stderr_path}"
++                )
++            if "--opt" in self.options.split():
++                self.opt_done = True
++            return stdout
+ 
+ 
+ class XTBP:

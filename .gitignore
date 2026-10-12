@@ -1,0 +1,23 @@
+# Python environments and caches
+.conda-env/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+
+# Local development and generated run artifacts
+/tests/
+/test-results/
+/dependencies/QupKake/
+build/
+dist/
+*.egg-info/
+
+# Editor and OS files
+.DS_Store
+*.swp

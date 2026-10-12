@@ -1,0 +1,3 @@
+# Example: consider ASP and GLU titration sites in chain A.
+# Remove --selections from the command to consider all titratable residues.
+- {CHAIN_ID: A, RES_NAME: [ASP, GLU], RES_ID: _, ATOM_NAME: _}
